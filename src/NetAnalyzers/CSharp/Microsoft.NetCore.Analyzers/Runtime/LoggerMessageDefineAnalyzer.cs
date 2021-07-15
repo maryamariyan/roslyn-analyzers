@@ -9,6 +9,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Operations;
 using Microsoft.CodeQuality.Analyzers;
 using Microsoft.Extensions.Logging;
 
@@ -114,25 +115,19 @@ namespace Microsoft.NetCore.CSharp.Analyzers.Runtime
                     return;
                 }
 
-                context.RegisterSyntaxNodeAction(context => AnalyzeInvocation(context, loggerType, loggerExtensionsType, loggerMessageType), SyntaxKind.InvocationExpression);
+                context.RegisterOperationAction(context => AnalyzeInvocation(context, loggerType, loggerExtensionsType, loggerMessageType), OperationKind.Invocation);
             });
         }
 
-        private void AnalyzeInvocation(SyntaxNodeAnalysisContext syntaxContext, INamedTypeSymbol loggerType, INamedTypeSymbol loggerExtensionsType, INamedTypeSymbol loggerMessageType)
+        private void AnalyzeInvocation(OperationAnalysisContext context, INamedTypeSymbol loggerType, INamedTypeSymbol loggerExtensionsType, INamedTypeSymbol loggerMessageType)
         {
-            var invocation = (InvocationExpressionSyntax)syntaxContext.Node;
+            var invocation = (IInvocationOperation)context.Operation;
 
-            var symbolInfo = ModelExtensions.GetSymbolInfo(syntaxContext.SemanticModel, invocation, syntaxContext.CancellationToken);
-            if (symbolInfo.Symbol?.Kind != SymbolKind.Method)
-            {
-                return;
-            }
-
-            var methodSymbol = (IMethodSymbol)symbolInfo.Symbol;
+            var methodSymbol = invocation.TargetMethod;
 
             if (methodSymbol.ContainingType == loggerExtensionsType)
             {
-                syntaxContext.ReportDiagnostic(Diagnostic.Create(CA1848Rule, invocation.GetLocation(), methodSymbol.Name));
+                context.ReportDiagnostic(Diagnostic.Create(CA1848Rule, invocation.Syntax.GetLocation(), methodSymbol.Name));
             }
             else if (!methodSymbol.ContainingType.Equals(loggerType) && !methodSymbol.ContainingType.Equals(loggerMessageType))
             {
@@ -142,32 +137,32 @@ namespace Microsoft.NetCore.CSharp.Analyzers.Runtime
             if (FindLogParameters(methodSymbol, out var messageArgument, out var paramsArgument))
             {
                 int paramsCount = 0;
-                ExpressionSyntax? formatExpression = null;
+                IOperation? formatExpression = null;
                 bool argsIsArray = false;
 
                 if (methodSymbol.ContainingType == loggerMessageType)
                 {
                     // For LoggerMessage.Define, count type parameters on the invocation instead of arguments
                     paramsCount = methodSymbol.TypeParameters.Length;
-                    var arg = invocation.ArgumentList.Arguments.FirstOrDefault(argument =>
+                    var arg = invocation.Arguments.FirstOrDefault(argument =>
                     {
-                        var parameter = DetermineParameter(argument, syntaxContext.SemanticModel, syntaxContext.CancellationToken);
+                        var parameter = argument.Parameter;
                         return Equals(parameter, messageArgument);
                     });
-                    formatExpression = arg.Expression;
+                    formatExpression = arg.Value;
                 }
                 else
                 {
-                    foreach (var argument in invocation.ArgumentList.Arguments)
+                    foreach (var argument in invocation.Arguments)
                     {
-                        var parameter = DetermineParameter(argument, syntaxContext.SemanticModel, syntaxContext.CancellationToken);
+                        var parameter = argument.Parameter;
                         if (Equals(parameter, messageArgument))
                         {
-                            formatExpression = argument.Expression;
+                            formatExpression = argument.Value;
                         }
                         else if (Equals(parameter, paramsArgument))
                         {
-                            var parameterType = syntaxContext.SemanticModel.GetTypeInfo(argument.Expression).ConvertedType;
+                            var parameterType = argument.Parameter.Type;// TODO test
                             if (parameterType == null)
                             {
                                 return;
@@ -183,17 +178,17 @@ namespace Microsoft.NetCore.CSharp.Analyzers.Runtime
 
                 if (formatExpression is not null)
                 {
-                    AnalyzeFormatArgument(syntaxContext, formatExpression, paramsCount, argsIsArray);
+                    AnalyzeFormatArgument(context, formatExpression, paramsCount, argsIsArray);
                 }
             }
         }
 
-        private void AnalyzeFormatArgument(SyntaxNodeAnalysisContext syntaxContext, ExpressionSyntax formatExpression, int paramsCount, bool argsIsArray)
+        private void AnalyzeFormatArgument(OperationAnalysisContext context, IOperation formatExpression, int paramsCount, bool argsIsArray)
         {
-            var text = TryGetFormatText(formatExpression, syntaxContext.SemanticModel);
+            var text = TryGetFormatText(formatExpression, context.SemanticModel);
             if (text == null)
             {
-                syntaxContext.ReportDiagnostic(Diagnostic.Create(CA2254Rule, formatExpression.GetLocation()));
+                context.ReportDiagnostic(Diagnostic.Create(CA2254Rule, formatExpression.Syntax.GetLocation()));
                 return;
             }
 
@@ -213,27 +208,27 @@ namespace Microsoft.NetCore.CSharp.Analyzers.Runtime
             {
                 if (int.TryParse(valueName, out _))
                 {
-                    syntaxContext.ReportDiagnostic(Diagnostic.Create(CA2253Rule, formatExpression.GetLocation()));
+                    context.ReportDiagnostic(Diagnostic.Create(CA2253Rule, formatExpression.Syntax.GetLocation()));
                 }
                 else if (char.IsLower(valueName[0]))
                 {
-                    syntaxContext.ReportDiagnostic(Diagnostic.Create(CA1727Rule, formatExpression.GetLocation()));
+                    context.ReportDiagnostic(Diagnostic.Create(CA1727Rule, formatExpression.Syntax.GetLocation()));
                 }
             }
 
             var argsPassedDirectly = argsIsArray && paramsCount == 1;
             if (!argsPassedDirectly && paramsCount != formatter.ValueNames.Count)
             {
-                syntaxContext.ReportDiagnostic(Diagnostic.Create(CA2255Rule, formatExpression.GetLocation()));
+                context.ReportDiagnostic(Diagnostic.Create(CA2255Rule, formatExpression.Syntax.GetLocation()));
             }
         }
 
-        private string? TryGetFormatText(ExpressionSyntax? argumentExpression, SemanticModel semanticModel)
+        private string? TryGetFormatText(IOperation? argumentExpression, SemanticModel semanticModel)
         {
             if (argumentExpression is null)
                 return null;
 
-            switch (argumentExpression)
+            switch (argumentExpression.Syntax)
             {
                 case LiteralExpressionSyntax literal when literal.Token.IsKind(SyntaxKind.StringLiteralToken):
                     return literal.Token.ValueText;
